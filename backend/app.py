@@ -11,10 +11,37 @@ import pytesseract
 from PIL import Image
 import io
 import shutil
-
+import typesense
+import pypandoc
+import PyPDF2
+from google import genai
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app)
+
+API_KEY = "AIzaSyDyfZKL2aJ42eQxoIlItz-U_8sUbv8--4Q"
+
+gemi = genai.Client(api_key=API_KEY)
+#
+# create_response = client.collections.create({
+#     "name": "books",
+#     "fields": [
+#         {"name": "title", "type": "string"},
+#         {"name": "content", "type": "string"},
+#         {
+#             "name": "embedding",
+#             "type": "float[]",
+#             "embed": {
+#               "from": [
+#                 "content"
+#               ],
+#               "model_config": {
+#                 "model_name": "ts/all-MiniLM-L12-v2"
+#               }
+#             }
+#           }
+#     ]
+# })
 
 # Configure SQLite database
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///dms.db'
@@ -67,8 +94,6 @@ class Document(db.Model):
     content = db.Column(db.Text, nullable=True)
     thumbnail = db.Column(db.String(255), nullable=True)
     file_path = db.Column(db.String(255), nullable=False)
-    # New field: required_privilege (minimum role required to access this document)
-    required_privilege = db.Column(db.String(20), nullable=False, default='user')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -81,7 +106,6 @@ class Document(db.Model):
             'tags': json.loads(self.tags),
             'encrypted': self.encrypted,
             'access_level': self.access_level,
-            'required_privilege': self.required_privilege,
             'status': self.status,
             'owner_id': self.owner_id,
             'content': self.content,
@@ -134,30 +158,11 @@ class Workflow(db.Model):
             'updated_at': self.updated_at.isoformat()
         }
 
-# New Model for Audit Trail
-class AuditTrail(db.Model):
-    id = db.Column(db.String(36), primary_key=True)
-    document_id = db.Column(db.String(36), db.ForeignKey('document.id'), nullable=True)
-    user_id = db.Column(db.String(36), db.ForeignKey('user.id'), nullable=False)
-    action = db.Column(db.String(50), nullable=False)  # e.g., download, create, update, delete, share
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
-    details = db.Column(db.Text, nullable=True)
-    
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'document_id': self.document_id,
-            'user_id': self.user_id,
-            'action': self.action,
-            'timestamp': self.timestamp.isoformat(),
-            'details': self.details
-        }
-
 # Create database tables
 with app.app_context():
     db.create_all()
     
-    # Add default admin and regular user if they don't exist
+    # Add default users if they don't exist
     admin_user = User.query.filter_by(email='admin@example.com').first()
     if not admin_user:
         admin_user = User(
@@ -182,35 +187,6 @@ with app.app_context():
         
     db.session.commit()
 
-# Helper function to check document access based on privilege levels
-def can_access_document(document, user):
-    role_rank = {'user': 1, 'manager': 2, 'admin': 3}
-    # Admin always has access.
-    if user.role == 'admin':
-        return True
-    # Owner always has access.
-    if document.owner_id == user.id:
-        return True
-    # If document is shared or public, allow access.
-    if document.access_level in ['shared', 'public']:
-        return True
-    # Only allow if current user's role is strictly higher than the document's required privilege.
-    if role_rank.get(user.role, 0) > role_rank.get(document.required_privilege, 1):
-        return True
-    return False
-
-# Helper function to log audit events.
-def log_audit(action, document_id, details=""):
-    audit = AuditTrail(
-        id=str(uuid.uuid4()),
-        document_id=document_id,
-        user_id=g.current_user.id,
-        action=action,
-        details=details
-    )
-    db.session.add(audit)
-    db.session.commit()
-
 # Simple authentication middleware
 def authenticate(f):
     def wrapper(*args, **kwargs):
@@ -229,7 +205,7 @@ def authenticate(f):
     wrapper.__name__ = f.__name__
     return wrapper
 
-# Authentication routes (login remains unchanged)
+# Authentication routes
 @app.route('/api/token', methods=['POST'])
 def login():
     data = request.json
@@ -249,15 +225,8 @@ def login():
         'token_type': 'bearer'
     })
 
-# ===============================
-# Admin User Management Endpoints
-# ===============================
-@app.route('/api/admin/users', methods=['POST'])
-@authenticate
-def admin_create_user():
-    if g.current_user.role != 'admin':
-        return jsonify({'error': 'Admin privileges required'}), 403
-
+@app.route('/api/register', methods=['POST'])
+def register():
     data = request.json
     email = data.get('email')
     name = data.get('name')
@@ -283,24 +252,12 @@ def admin_create_user():
     
     return jsonify(user.to_dict())
 
-@app.route('/api/admin/users/<user_id>', methods=['DELETE'])
+@app.route('/api/users/me', methods=['GET'])
 @authenticate
-def admin_delete_user(user_id):
-    if g.current_user.role != 'admin':
-        return jsonify({'error': 'Admin privileges required'}), 403
-    
-    user = User.query.get_or_404(user_id)
-    if user.id == g.current_user.id:
-        return jsonify({'error': 'Cannot delete yourself'}), 400
-    
-    db.session.delete(user)
-    db.session.commit()
-    
-    return '', 204
+def get_current_user():
+    return jsonify(g.current_user.to_dict())
 
-# ======================
-# Document Endpoints
-# ======================
+# Document routes
 @app.route('/api/documents', methods=['POST'])
 @authenticate
 def create_document():
@@ -314,30 +271,48 @@ def create_document():
     tags = json.loads(request.form.get('tags', '[]'))
     access_level = request.form.get('access_level', 'private')
     encrypt = request.form.get('encrypt', 'false').lower() == 'true'
-    # New: Accept required_privilege from form; default to uploader's role if not provided.
-    required_privilege = request.form.get('required_privilege', g.current_user.role)
     
+    # Generate unique filename
     filename = secure_filename(file.filename)
     file_id = str(uuid.uuid4())
     file_ext = os.path.splitext(filename)[1]
     unique_filename = f"{file_id}{file_ext}"
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
     
+    # Save file
     file.save(file_path)
     
+    # Get file info
     file_size = os.path.getsize(file_path)
     file_type = file_ext[1:] if file_ext else ''
     
+    # Extract text content if possible
     content = None
-    if file_type.lower() in ['txt', 'pdf', 'doc', 'docx']:
-        content = "Extracted text content would go here"
+    if file_type.lower() in [ 'doc', 'docx']:
+        # In a real app, you would use appropriate libraries for each file type
+        # For this example, we'll just use a placeholder
+        content = pypandoc.convert_file(file_path, 'rst')
+
     elif file_type.lower() in ['jpg', 'jpeg', 'png']:
+        # Use OCR for images
         try:
             image = Image.open(file_path)
             content = pytesseract.image_to_string(image)
+            print(content)
         except Exception as e:
             content = f"Error extracting text: {str(e)}"
-    
+    elif file_type.lower() == 'pdf':
+        with open(file_path,'rb') as pf:
+            pdfreader = PyPDF2.PdfReader(pf)
+            text = ''
+            for i in range(len(pdfreader.pages)):
+                page = pdfreader.pages[i]
+                text += page.extract()
+        content = text
+    elif file_type.lower() == 'txt':
+        with open(file_path,'r') as p:
+            content= p.read()
+    # Create document record
     document = Document(
         id=file_id,
         name=filename,
@@ -346,27 +321,27 @@ def create_document():
         tags=json.dumps(tags),
         encrypted=encrypt,
         access_level=access_level,
-        required_privilege=required_privilege,
         status='pending',
         owner_id=g.current_user.id,
         content=content,
         file_path=file_path
     )
-    
+   
     db.session.add(document)
     db.session.commit()
-    
-    # Log audit trail for document creation
-    log_audit("create", document.id, details="Document created.")
+    gemresponse = gemi.models.generate_content(
+    model="gemini-2.0-flash",
+    contents="Gather the important data. the name of the project deadline events with dates.return the output in a json format like title: string, events:array with name: date and deadlines: date.do not add the word json." + content ,
+
+)
+    print(gemresponse.text)
+
     
     return jsonify(document.to_dict())
 
 @app.route('/api/documents', methods=['GET'])
 @authenticate
 def get_documents():
-    # Start with base query applying search filters
-    query = Document.query
-
     search = request.args.get('search')
     tags = request.args.getlist('tags')
     file_type = request.args.get('file_type')
@@ -374,6 +349,16 @@ def get_documents():
     status = request.args.get('status')
     encrypted = request.args.get('encrypted')
     
+    # Start with base query
+    query = Document.query
+    
+    # Filter by owner or public/shared access
+    query = query.filter(
+        (Document.owner_id == g.current_user.id) | 
+        (Document.access_level != 'private')
+    )
+    
+    # Apply filters
     if search:
         query = query.filter(
             (Document.name.ilike(f'%{search}%')) | 
@@ -393,34 +378,33 @@ def get_documents():
         encrypted_bool = encrypted.lower() == 'true'
         query = query.filter_by(encrypted=encrypted_bool)
     
-    # Fix tag search: search for each tag with quotes to match JSON strings.
+    # Filter by tags (more complex since tags are stored as JSON)
     if tags:
         for tag in tags:
-            query = query.filter(Document.tags.like(f'%"{tag}"%'))
+            query = query.filter(Document.tags.like(f'%{tag}%'))
     
-    # After query filters, only return documents the current user can access
-    all_docs = query.all()
-    filtered_docs = [doc for doc in all_docs if can_access_document(doc, g.current_user)]
-    
-    return jsonify([doc.to_dict() for doc in filtered_docs])
+    documents = query.all()
+    return jsonify([doc.to_dict() for doc in documents])
 
 @app.route('/api/documents/<document_id>', methods=['GET'])
 @authenticate
 def get_document(document_id):
     document = Document.query.get_or_404(document_id)
-    if not can_access_document(document, g.current_user):
+    
+    # Check if user has access
+    if document.owner_id != g.current_user.id and document.access_level == 'private':
         return jsonify({'error': 'You do not have permission to access this document'}), 403
+    
     return jsonify(document.to_dict())
 
 @app.route('/api/documents/<document_id>/download', methods=['GET'])
 @authenticate
 def download_document(document_id):
     document = Document.query.get_or_404(document_id)
-    if not can_access_document(document, g.current_user):
-        return jsonify({'error': 'You do not have permission to access this document'}), 403
     
-    # Log audit trail for download action.
-    log_audit("download", document.id, details="Document downloaded.")
+    # Check if user has access
+    if document.owner_id != g.current_user.id and document.access_level == 'private':
+        return jsonify({'error': 'You do not have permission to access this document'}), 403
     
     return send_file(document.file_path, as_attachment=True, download_name=document.name)
 
@@ -428,26 +412,30 @@ def download_document(document_id):
 @authenticate
 def update_document(document_id):
     document = Document.query.get_or_404(document_id)
-    if not can_access_document(document, g.current_user):
+    
+    # Check if user has permission
+    if document.owner_id != g.current_user.id and g.current_user.role != 'admin':
         return jsonify({'error': 'You do not have permission to update this document'}), 403
     
     data = request.json
+    
+    # Update allowed fields
     if 'name' in data:
         document.name = data['name']
+    
     if 'tags' in data:
         document.tags = json.dumps(data['tags'])
+    
     if 'access_level' in data:
         document.access_level = data['access_level']
+    
     if 'status' in data:
         document.status = data['status']
+    
     if 'encrypted' in data:
         document.encrypted = data['encrypted']
-    if 'required_privilege' in data:
-        document.required_privilege = data['required_privilege']
     
     db.session.commit()
-    
-    log_audit("update", document.id, details="Document updated.")
     
     return jsonify(document.to_dict())
 
@@ -455,18 +443,20 @@ def update_document(document_id):
 @authenticate
 def delete_document(document_id):
     document = Document.query.get_or_404(document_id)
-    if not can_access_document(document, g.current_user):
+    
+    # Check if user has permission
+    if document.owner_id != g.current_user.id and g.current_user.role != 'admin':
         return jsonify({'error': 'You do not have permission to delete this document'}), 403
     
+    # Delete the file
     try:
         os.remove(document.file_path)
     except:
-        pass
+        pass  # Ignore if file doesn't exist
     
+    # Delete the document record
     db.session.delete(document)
     db.session.commit()
-    
-    log_audit("delete", document.id, details="Document deleted.")
     
     return '', 204
 
@@ -474,13 +464,15 @@ def delete_document(document_id):
 @authenticate
 def encrypt_document(document_id):
     document = Document.query.get_or_404(document_id)
-    if not can_access_document(document, g.current_user):
+    
+    # Check if user has permission
+    if document.owner_id != g.current_user.id and g.current_user.role != 'admin':
         return jsonify({'error': 'You do not have permission to encrypt this document'}), 403
     
+    # In a real app, you would encrypt the document content
+    # For this example, we'll just mark it as encrypted
     document.encrypted = True
     db.session.commit()
-    
-    log_audit("encrypt", document.id, details="Document encrypted.")
     
     return jsonify(document.to_dict())
 
@@ -488,13 +480,15 @@ def encrypt_document(document_id):
 @authenticate
 def decrypt_document(document_id):
     document = Document.query.get_or_404(document_id)
-    if not can_access_document(document, g.current_user):
+    
+    # Check if user has permission
+    if document.owner_id != g.current_user.id and g.current_user.role != 'admin':
         return jsonify({'error': 'You do not have permission to decrypt this document'}), 403
     
+    # In a real app, you would decrypt the document content
+    # For this example, we'll just mark it as not encrypted
     document.encrypted = False
     db.session.commit()
-    
-    log_audit("decrypt", document.id, details="Document decrypted.")
     
     return jsonify(document.to_dict())
 
@@ -502,27 +496,27 @@ def decrypt_document(document_id):
 @authenticate
 def share_document(document_id):
     document = Document.query.get_or_404(document_id)
-    if not can_access_document(document, g.current_user):
+    
+    # Check if user has permission
+    if document.owner_id != g.current_user.id and g.current_user.role != 'admin':
         return jsonify({'error': 'You do not have permission to share this document'}), 403
     
+    # Update access level to shared if it's private
     if document.access_level == 'private':
         document.access_level = 'shared'
         db.session.commit()
-        log_audit("share", document.id, details="Document shared.")
     
     return '', 204
 
-# ======================
-# Workflow Endpoints (unchanged from previous admin-only modifications)
-# ======================
+# Workflow routes
 @app.route('/api/workflows', methods=['POST'])
 @authenticate
 def create_workflow():
-    if g.current_user.role != 'admin':
-        return jsonify({'error': 'Admin privileges required to create workflows'}), 403
-    
     data = request.json
+    
     workflow_id = str(uuid.uuid4())
+    
+    # Create workflow
     workflow = Workflow(
         id=workflow_id,
         name=data['name'],
@@ -530,8 +524,10 @@ def create_workflow():
         status=data['status'],
         assignees=json.dumps(data.get('assignees', []))
     )
+    
     db.session.add(workflow)
     
+    # Create workflow steps
     for step_data in data.get('steps', []):
         step = WorkflowStep(
             id=str(uuid.uuid4()),
@@ -545,15 +541,19 @@ def create_workflow():
         db.session.add(step)
     
     db.session.commit()
+    
     return jsonify(workflow.to_dict())
 
 @app.route('/api/workflows', methods=['GET'])
 @authenticate
 def get_workflows():
     status = request.args.get('status')
+    
     query = Workflow.query
+    
     if status:
         query = query.filter_by(status=status)
+    
     workflows = query.all()
     return jsonify([workflow.to_dict() for workflow in workflows])
 
@@ -566,22 +566,28 @@ def get_workflow(workflow_id):
 @app.route('/api/workflows/<workflow_id>', methods=['PUT'])
 @authenticate
 def update_workflow(workflow_id):
-    if g.current_user.role != 'admin':
-        return jsonify({'error': 'Admin privileges required to update workflows'}), 403
-    
     workflow = Workflow.query.get_or_404(workflow_id)
     data = request.json
+    
+    # Update workflow fields
     if 'name' in data:
         workflow.name = data['name']
+    
     if 'description' in data:
         workflow.description = data['description']
+    
     if 'status' in data:
         workflow.status = data['status']
+    
     if 'assignees' in data:
         workflow.assignees = json.dumps(data['assignees'])
     
+    # Update steps if provided
     if 'steps' in data:
+        # Delete existing steps
         WorkflowStep.query.filter_by(workflow_id=workflow_id).delete()
+        
+        # Create new steps
         for step_data in data['steps']:
             step = WorkflowStep(
                 id=str(uuid.uuid4()),
@@ -595,69 +601,65 @@ def update_workflow(workflow_id):
             db.session.add(step)
     
     db.session.commit()
+    
     return jsonify(workflow.to_dict())
 
 @app.route('/api/workflows/<workflow_id>/steps/<step_id>', methods=['PUT'])
 @authenticate
 def update_workflow_step(workflow_id, step_id):
-    if g.current_user.role != 'admin':
-        return jsonify({'error': 'Admin privileges required to update workflow steps'}), 403
-    
     step = WorkflowStep.query.filter_by(id=step_id, workflow_id=workflow_id).first_or_404()
     data = request.json
+    
+    # Update step fields
     if 'name' in data:
         step.name = data['name']
+    
     if 'description' in data:
         step.description = data['description']
+    
     if 'status' in data:
         step.status = data['status']
+    
     if 'assignee' in data:
         step.assignee = data['assignee']
+    
     if 'due_date' in data:
         step.due_date = datetime.fromisoformat(data['due_date']) if data['due_date'] else None
+    
     db.session.commit()
+    
     return jsonify(step.to_dict())
 
 @app.route('/api/workflows/<workflow_id>', methods=['DELETE'])
 @authenticate
 def delete_workflow(workflow_id):
-    if g.current_user.role != 'admin':
-        return jsonify({'error': 'Admin privileges required to delete workflows'}), 403
-    
     workflow = Workflow.query.get_or_404(workflow_id)
+    
     db.session.delete(workflow)
     db.session.commit()
+    
     return '', 204
 
-# ======================
-# Audit Trail Endpoint
-# ======================
-@app.route('/api/audit/trail', methods=['GET'])
-@authenticate
-def get_audit_trail():
-    # Admin users see all records; others see only their own audit records.
-    if g.current_user.role == 'admin':
-        audits = AuditTrail.query.all()
-    else:
-        audits = AuditTrail.query.filter_by(user_id=g.current_user.id).all()
-    return jsonify([audit.to_dict() for audit in audits])
-
-# ======================
-# Dashboard and Settings Endpoints
-# ======================
+# Dashboard routes
 @app.route('/api/dashboard/stats', methods=['GET'])
 @authenticate
 def get_dashboard_stats():
+    # Count documents
     total_documents = Document.query.count()
     encrypted_documents = Document.query.filter_by(encrypted=True).count()
     shared_documents = Document.query.filter_by(access_level='shared').count()
     pending_documents = Document.query.filter_by(status='pending').count()
     
+    # Get document counts by type
     document_types = {}
     for doc in Document.query.all():
         doc_type = doc.type
-        document_types[doc_type] = document_types.get(doc_type, 0) + 1
+        if doc_type in document_types:
+            document_types[doc_type] += 1
+        else:
+            document_types[doc_type] = 1
     
+    # Get all unique tags
     all_tags = set()
     for doc in Document.query.all():
         all_tags.update(json.loads(doc.tags))
@@ -675,14 +677,24 @@ def get_dashboard_stats():
 @authenticate
 def get_recent_documents():
     limit = request.args.get('limit', 5, type=int)
-    docs = Document.query.order_by(Document.updated_at.desc()).limit(limit).all()
-    # Only return documents that the current user can access.
-    accessible_docs = [doc for doc in docs if can_access_document(doc, g.current_user)]
-    return jsonify([doc.to_dict() for doc in accessible_docs])
+    
+    # Get documents accessible to the user
+    query = Document.query.filter(
+        (Document.owner_id == g.current_user.id) | 
+        (Document.access_level != 'private')
+    )
+    
+    # Sort by updated_at (most recent first) and limit results
+    recent_docs = query.order_by(Document.updated_at.desc()).limit(limit).all()
+    
+    return jsonify([doc.to_dict() for doc in recent_docs])
 
+# Settings routes
 @app.route('/api/settings', methods=['GET'])
 @authenticate
 def get_settings():
+    # In a real app, you would fetch user settings from a database
+    # For this example, we'll return mock settings
     return jsonify({
         'general': {
             'company_name': 'Acme Inc.',
@@ -719,11 +731,16 @@ def get_settings():
 @app.route('/api/settings', methods=['PUT'])
 @authenticate
 def update_settings():
+    # In a real app, you would update user settings in a database
+    # For this example, we'll just return the updated settings
     return jsonify(request.json)
 
+# Template routes
 @app.route('/api/templates', methods=['GET'])
 @authenticate
 def get_templates():
+    # In a real app, you would fetch templates from a database
+    # For this example, we'll return mock templates
     return jsonify([
         {
             'id': '1',
