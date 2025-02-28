@@ -1,1 +1,1 @@
-# intelligent-DMS
+# INTELLIGENT-DMS
