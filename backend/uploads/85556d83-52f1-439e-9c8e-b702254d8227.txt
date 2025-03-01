@@ -1,0 +1,5 @@
+Project: Apollo Launch
+Deadline Events:
+•⁠  ⁠Design Phase Deadline: 2025-06-15
+•⁠  ⁠Development Phase Deadline: 2025-07-30
+•⁠  ⁠Final Review Deadline: 2025-08-10
