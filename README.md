@@ -1,4 +1,3 @@
-# TEAM NULL
 # 📂 Intelligent Document Management System (DMS)
 
 **Intelligent DMS** is a smart document management system designed to **store, organize, manage, and track** digital files efficiently. It leverages **AI-powered text extraction** and **OCR technology** to enhance document retrieval, security, and accessibility.
