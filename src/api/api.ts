@@ -3,7 +3,7 @@ import { useAuthStore } from '../stores/authStore';
 
 // Create axios instance with base URL
 const api = axios.create({
-  baseURL: 'http://localhost:8000/api',
+  baseURL: 'https://intelligentdms.onrender.com/api',
 });
 
 // Add request interceptor to add auth token to requests
