@@ -4,7 +4,7 @@ export const Workflows = () => {
   const [rawData, setRawData] = useState<string>('');
 
   useEffect(() => {
-    fetch('http://localhost:8000/api/workflow_news')
+    fetch('https://intelligentdms.onrender.com/api/workflow_new')
       .then(response => response.text())
       .then(text => {
         console.log('Raw response text:', text);
