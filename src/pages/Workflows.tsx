@@ -26,17 +26,24 @@ export const Workflows = () => {
 
     return (
         <div>
-            {/*<h2>Raw Workflow Data</h2>*/}
             {
                 deadlines.map((data) => {
-                    return (
-                        <div className="workflow-card m-2 p-2 ">
-                            <h2>{data.project_title}</h2>
-                            <p>{data.deadline}</p>
-                        </div>
-                    )
+                    if (data !== undefined || {}) {
+                        return (
+                            <div className="workflow-card m-2 p-2 ">
+                                <h2>{data.project_title}</h2>
+                                <p>{data.deadline}</p>
+                            </div>
+                        )
+                    } else {
+                        return (<div className="workflow-card m-2 p-2 ">
+                            <h2>Error Generating Insights</h2>
+                            <p>""</p>
+                        </div>);
+                    }
                 })
             }
         </div>
-    );
+    )
+        ;
 };
